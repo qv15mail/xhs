@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import uuid
+import urllib.parse
 
 from app.core.config import settings
 from app.models import Note
@@ -62,6 +63,97 @@ def _mock_note(i: int, task_id: str, topic: str) -> Note:
 class Collector:
     """采集器：默认 mock；real 模式走 Playwright（需用户自有登录态）。"""
 
+    # 详情页 DOM 抽取脚本（含从 __INITIAL_STATE__ 兜底解析）。
+    _NOTE_DETAIL_SCRIPT = r"""
+        (noteId) => {
+            const result = {
+                noteId: noteId,
+                title: '',
+                author: '',
+                likes: 0,
+                collects: 0,
+                comments: 0,
+                shares: 0,
+                publishTime: '',
+                content: '',
+                tags: []
+            };
+
+            const text = (el) => el ? el.textContent.trim() : '';
+
+            const titleEl = document.querySelector('h1, .note-article__title, .note-container__title, .article-title');
+            if (titleEl) result.title = text(titleEl);
+            if (!result.title) {
+                const exploreTitle = document.querySelector('.note-detail__title, .detail__title, .note-info__title');
+                if (exploreTitle) result.title = text(exploreTitle);
+            }
+
+            const authorEl = document.querySelector('.author__name, .author-name, .user-name, .note-detail__author, .detail-author');
+            if (authorEl) result.author = text(authorEl);
+
+            const timeEl = document.querySelector('.publish-time, .time, [class*="time"]');
+            if (timeEl) result.publishTime = text(timeEl);
+
+            const contentEl = document.querySelector('.article-article .article-content, .note-article__content, .note-detail__content, .article-title + p, .markdown-body, .note-content');
+            if (contentEl) result.content = text(contentEl);
+
+            const tagEls = document.querySelectorAll('[class*="tag"], .search-result__tags, .note-detail__tag, .hashtag');
+            tagEls.forEach(el => {
+                const t = text(el);
+                if (t && !t.includes('话题')) result.tags.push(t);
+            });
+
+            // 从 window.__INITIAL_STATE__ / __INITIAL_SSR_STATE__ 兜底提取结构化数据
+            const findInState = (root) => {
+                if (!root || typeof root !== 'object') return null;
+                if (root.noteId === noteId || root.note_id === noteId) return root;
+                for (const key of Object.keys(root)) {
+                    if (key === '__N_SSP__' || key === '__N_SSG__') continue;
+                    try {
+                        const hit = findInState(root[key]);
+                        if (hit) return hit;
+                    } catch (e) { /* 忽略循环引用等异常 */ }
+                }
+                return null;
+            };
+
+            try {
+                const initialState = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
+                if (initialState) {
+                    const noteData = findInState(initialState);
+                    const note = noteData && (noteData.note || noteData.noteCard || noteData);
+                    if (note) {
+                        if (!result.title) result.title = note.title || '';
+                        if (!result.author) {
+                            const u = note.user || note.author || {};
+                            result.author = u.nickname || u.nickName || u.nickname_or_id || result.author;
+                        }
+                        if (!result.content) result.content = note.content || note.desc || note.markdown_desc || '';
+                        const ii = note.interactInfo || note.interact_info;
+                        if (ii) {
+                            result.likes = ii.liked_count || ii.likedCount || 0;
+                            result.collects = ii.collected_count || ii.collectedCount || 0;
+                            result.comments = ii.comment_count || ii.commentCount || 0;
+                            result.shares = ii.share_count || ii.shareCount || 0;
+                        }
+                        if (Array.isArray(note.tagList)) {
+                            note.tagList.forEach(t => { if (t && t.name) result.tags.push(t.name); });
+                        } else if (Array.isArray(note.tags)) {
+                            note.tags.forEach(t => {
+                                const name = typeof t === 'string' ? t : (t && (t.name || t.noteName));
+                                if (name) result.tags.push(name);
+                            });
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('[Collector] 解析 __INITIAL_STATE__ 失败', e);
+            }
+
+            return result;
+        }
+    """
+
     def __init__(self, mode: str | None = None):
         self.mode = mode or settings.collect_mode
 
@@ -80,11 +172,11 @@ class Collector:
 
     async def _collect_real(self, task_id: str, topic: str, total: int, limiter: RateLimiter):
         """
-        真实采集路径（隔离实现）。
+        真实采集路径：Playwright 持久化上下文。
 
-        说明：小红书官方 API 不对普通开发者开放，这里采用 Playwright 持久化上下文，
-        复用用户「自有账号」登录态，并在浏览器内调用页面自带签名逻辑发起请求。
-        为避免依赖未安装的浏览器导致整体不可用，此处在浏览器不可用时回退到 mock。
+        由于小红书搜索页有较强的反爬措施，采用更可靠的方式：
+        1. 直接访问推荐页，收集笔记 URL
+        2. 逐条访问详情页提取数据
         """
         try:
             from playwright.async_api import async_playwright
@@ -93,28 +185,184 @@ class Collector:
                 yield _mock_note(i, task_id, topic)
             return
 
+        user_data_dir = settings.user_data_dir
+        state_path = f"{user_data_dir}/storage_state.json"
+
         try:
             async with async_playwright() as p:
+                if not __import__("os").path.exists(state_path):
+                    print(
+                        f"[Collector] 未找到登录态文件 {state_path}，请先在浏览器中完成登录..."
+                    )
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir, headless=False, viewport={"width": 1280, "height": 800}
+                    )
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    await page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded")
+                    print(
+                        "[Collector] 请在打开的浏览器中完成登录；登录完成后请按回车继续..."
+                    )
+                    await asyncio.to_thread(input)
+                    await context.storage_state(path=state_path)
+                    await context.close()
+                    print(f"[Collector] 登录态已保存: {state_path}")
+
+                # ===== 正式采集 =====
                 context = await p.chromium.launch_persistent_context(
-                    settings.user_data_dir, headless=True
+                    user_data_dir,
+                    headless=False,
                 )
                 page = await context.new_page()
-                # 实际项目中：访问搜索页 -> 提取 note_id 列表 -> 逐条详情(浏览器内签名)
-                # 此处保留结构骨架，详情解析依赖平台页面结构，需在 real 模式下完善。
-                await page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded")
+
+                # 先访问首页加载登录态
+                await page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+
+                # 从首页提取 note_id
+                note_ids = await self._extract_note_ids_from_page_async(page)
+                print(f"[Collector] 首页提取到 {len(note_ids)} 个笔记")
+
+                # 滚动加载更多
+                for page_num in range(5):
+                    if len(note_ids) >= total:
+                        break
+                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    await page.wait_for_timeout(3000)
+                    new_ids = await self._extract_note_ids_from_page_async(page)
+                    added = [nid for nid in new_ids if nid not in note_ids]
+                    note_ids.extend(added)
+                    print(f"[Collector] 滚动 #{page_num + 1} 后共 {len(note_ids)} 个笔记")
+
+                if not note_ids:
+                    # 首页没拿到，尝试搜索页
+                    print("[Collector] 首页未找到笔记，尝试搜索页...")
+                    search_url = f"https://www.xiaohongshu.com/search_result?keyword={urllib.parse.quote(topic)}&source=web_search_result_notes"
+                    await page.goto(search_url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+                    note_ids = await self._extract_note_ids_from_page_async(page)
+                    print(f"[Collector] 搜索页提取到 {len(note_ids)} 个笔记")
+
+                # 如果还是不够，从推荐页的链接中获取更多
+                for page_num in range(5):
+                    if len(note_ids) >= total:
+                        break
+                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                    await page.wait_for_timeout(2000)
+                    new_ids = await self._extract_note_ids_from_page_async(page)
+                    added = [nid for nid in new_ids if nid not in note_ids]
+                    note_ids.extend(added)
+                    print(f"[Collector] 继续滚动 #{page_num + 1} 后共 {len(note_ids)} 个笔记")
+
+                # 逐条访问详情页提取数据
                 count = 0
-                while count < total:
+                for note_id in note_ids[:total]:
                     await limiter.acquire()
                     try:
                         await limiter.wait()
-                        yield _mock_note(count, task_id, topic)  # 占位：替换为真实解析结果
-                        count += 1
+                        note = await self._fetch_note_detail(page, task_id, note_id)
+                        if note:
+                            yield note
+                            count += 1
+                            print(f"[Collector] 已采集 {count}/{total}: {note.title}")
+                        else:
+                            print(f"[Collector] 跳过 {note_id}（无法获取详情）")
+                    except Exception as e:
+                        print(f"[Collector] 采集 {note_id} 失败: {e}")
                     finally:
                         limiter.release()
+
+                print(f"[Collector] 采集完成: {count}/{total}")
                 await context.close()
-        except Exception:  # noqa: BLE001
+
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            print(f"[Collector] 采集异常: {e}")
             for i in range(total):
                 yield _mock_note(i, task_id, topic)
+
+    def _extract_note_ids_from_page(self, page) -> list[str]:
+        """从当前页面提取所有 note_id（通过 JavaScript 执行）"""
+        return page.evaluate("""
+            () => {
+                const allLinks = document.querySelectorAll('a');
+                const ids = [];
+                const seen = new Set();
+                allLinks.forEach(a => {
+                    const href = a.href;
+                    // 匹配 search_result/{noteId} 或 explore/{noteId}
+                    const searchMatch = href.match(/search_result\\/([a-f0-9]+)/);
+                    const exploreMatch = href.match(/explore\\/([a-f0-9]+)/);
+                    const match = searchMatch || exploreMatch;
+                    if (match && match[1] && !seen.has(match[1])) {
+                        seen.add(match[1]);
+                        ids.push(match[1]);
+                    }
+                });
+                return ids;
+            }
+        """)
+
+    async def _extract_note_ids_from_page_async(self, page) -> list[str]:
+        """异步版提取 note_id"""
+        return await self._extract_note_ids_from_page(page)
+
+    async def _fetch_note_detail(self, page, task_id: str, note_id: str) -> Note | None:
+        """访问笔记详情页提取结构化数据"""
+        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(3000)  # 等待 JS 渲染
+
+            # 从页面提取笔记数据
+            data = await page.evaluate(self._NOTE_DETAIL_SCRIPT, note_id)
+
+            if not data.get("title") and not data.get("author"):
+                # 尝试了所有方式都没拿到数据，可能页面被风控
+                print(f"[Collector] 未获取到笔记 {note_id} 的数据，回退到 mock")
+                return self._fallback_note(task_id, note_id, note_id)
+
+            return Note(
+                id=f"{task_id}-{note_id}",
+                task_id=task_id,
+                note_id=note_id,
+                title=data["title"] or f"小红书笔记 {note_id}",
+                content=data["content"] or f"这是一篇关于 {data['title']} 的小红书笔记。",
+                author=data["author"] or "小红书用户",
+                likes=data["likes"],
+                collects=data["collects"],
+                comments=data["comments"],
+                shares=data["shares"],
+                publish_time=data["publishTime"],
+                url=f"https://www.xiaohongshu.com/explore/{note_id}",
+                cover=random.choice(_COVERS),
+                images_json="[]",
+                tags_json=json.dumps(data.get("tags", ["小红书"]), ensure_ascii=False),
+            )
+
+        except Exception as e:
+            print(f"[Collector] 详情页请求失败 {note_id}: {e}")
+            return self._fallback_note(task_id, note_id, note_id)
+
+    def _fallback_note(self, task_id: str, note_id: str, _index: int) -> Note:
+        """当无法获取真实数据时的回退方案"""
+        return Note(
+            id=f"{task_id}-{note_id}",
+            task_id=task_id,
+            note_id=note_id,
+            title=f"小红书笔记 {note_id}",
+            content="正在采集数据...",
+            author="小红书用户",
+            likes=0,
+            collects=0,
+            comments=0,
+            shares=0,
+            publish_time="",
+            url=f"https://www.xiaohongshu.com/explore/{note_id}",
+            cover=random.choice(_COVERS),
+            images_json="[]",
+            tags_json=json.dumps(["小红书"], ensure_ascii=False),
+        )
 
 
 def new_task_id() -> str:

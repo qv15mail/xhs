@@ -44,11 +44,12 @@ async def compose_note(req: ComposeRequest, ref: Note | None, llm: LLMClient) ->
     try:
         data = await llm.chat_json(COMPOSE_SYSTEM, user)
         titles = [str(t) for t in data.get("titles", [])][:5]
+        fallback = _heuristic_compose(req)
         return ComposeOut(
-            titles=titles or _heuristic_compose(req).titles,
-            body=str(data.get("body", "")) or _heuristic_compose(req).body,
-            hashtags=[str(h).lstrip("#") for h in data.get("hashtags", [])] or [req.topic],
-            imageSuggestions=[str(s) for s in data.get("imageSuggestions", [])],
+            titles=titles or fallback.titles,
+            body=str(data.get("body", "")) or fallback.body,
+            hashtags=[str(h).lstrip("#") for h in data.get("hashtags", [])] or fallback.hashtags,
+            imageSuggestions=[str(s) for s in data.get("imageSuggestions", [])] or fallback.imageSuggestions,
         )
     except Exception:  # noqa: BLE001
         return _heuristic_compose(req)

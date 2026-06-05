@@ -74,12 +74,12 @@ export const api = {
     request<{ ok: boolean; message: string }>(`${ApiRoutes.settings}/test-llm`, { method: "POST" }),
 
   login: () =>
-    request<{ loggedIn: boolean }>(`${ApiRoutes.authStatus.replace("/status", "")}/login/confirm`, {
+    request<{ loggedIn: boolean }>(ApiRoutes.authLoginConfirm, {
       method: "POST",
     }),
 
   logout: () =>
-    request<{ loggedIn: boolean }>(`${ApiRoutes.authStatus.replace("/status", "")}/logout`, {
+    request<{ loggedIn: boolean }>(ApiRoutes.authLogout, {
       method: "POST",
     }),
 

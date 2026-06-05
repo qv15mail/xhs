@@ -6,6 +6,8 @@ export const ApiRoutes = {
   collectTask: (id: string) => `${API_BASE}/collect/tasks/${id}`,
   collectTaskEvents: (id: string) => `${API_BASE}/collect/tasks/${id}/events`,
   authLoginQrcode: `${API_BASE}/auth/login/qrcode`,
+  authLoginConfirm: `${API_BASE}/auth/login/confirm`,
+  authLogout: `${API_BASE}/auth/logout`,
   authStatus: `${API_BASE}/auth/status`,
   notes: `${API_BASE}/notes`,
   note: (id: string) => `${API_BASE}/notes/${id}`,

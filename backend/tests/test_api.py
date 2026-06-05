@@ -64,8 +64,23 @@ def test_create_task_and_collect_flow():
 
 
 def test_compose_heuristic():
+    # 清空 LLM 设置，确保走启发式兜底（不依赖 test_settings_roundtrip 留下的状态）
+    client.put(
+        "/api/settings",
+        json={
+            "llm": {"baseUrl": "", "apiKey": "", "model": "", "temperature": 0.5},
+            "collect": {
+                "defaultCount": 40,
+                "rateLevel": "standard",
+                "concurrency": 2,
+                "includeComments": True,
+            },
+        },
+    )
     r = client.post("/api/compose", json={"topic": "平价护肤"})
     assert r.status_code == 200
     data = r.json()
     assert len(data["titles"]) >= 1
     assert "平价护肤" in data["body"]
+    assert len(data["hashtags"]) >= 1
+    assert len(data["imageSuggestions"]) >= 1
