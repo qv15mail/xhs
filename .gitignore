@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+.xhs-user-data/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# Env / secrets
+.env
+*.env
+
+# OS
+.DS_Store
