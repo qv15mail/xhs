@@ -50,21 +50,33 @@
 ## 3. 模块设计
 
 ### 3.1 采集服务 (collector)
-- `BrowserManager`：管理 Playwright 持久化上下文（保存登录态到本地 user-data-dir）。
-- `LoginService`：扫码/Cookie 登录，检测登录态有效性。
-- `XhsClient`：在浏览器上下文内调用页面签名逻辑发起搜索/详情请求，返回结构化数据。
-- `RateLimiter`：随机延时 + 并发信号量 + 重试退避。
-- `Deduplicator`：按 note_id 去重。
+- `Collector`：`mock` 模式生成示例数据；`real` 模式走 Playwright 持久化上下文真实采集。
+- **真实采集流程（real）**：
+  1. **主题驱动**：优先打开搜索结果页 `search_result?keyword=主题`，从锚点 `a[href*="/search_result/"]` 提取 `(note_id, xsec_token, xsec_source)`（搜索页 href 自带 token）；数量不足时用推荐页 `explore` 补充（推荐页 token 在 `window.__INITIAL_STATE__.feed.feeds` 中）。
+  2. **详情抓取**：携带 `xsec_token` 访问 `explore/{id}?xsec_token=...&xsec_source=...`（**缺失 token 会被平台 302 到扫码墙/404**），优先从 `window.__INITIAL_STATE__.note.noteDetailMap` 解析标题/正文/作者/点赞/收藏/评论/分享/标签/配图，DOM 选择器兜底。
+  3. **清洗**：`_clean_content` 去除正文中的 `#话题[话题]#` 标记；`_to_int` 解析「1.2万 / 3亿」等中文计数。
+  4. 笔记 `url` 落库为**带 token 的完整地址**，供前端「原文」在登录态浏览器直接打开。
+- `RateLimiter`：随机延时（保守/标准档）+ 并发信号量。
+- 去重：按 `note_id` 去重。
+- **headless 限制**：登录与采集均使用 **headed** Chromium，headless 会触发平台「安全限制（300012）」。
 
-### 3.2 任务编排 (tasks)
+### 3.2 登录服务 (login)
+- `LoginManager`：正式扫码登录。打开持久化上下文的小红书登录页，抓取官方二维码图片 `img.qrcode-img`（base64 data URL）返回前端；后台轮询，以**持久化上下文中存在非空 `web_session` cookie** 作为权威登录判定（httpOnly，必须服务端 `context.cookies()` 读取）。
+- 成功后落库 `storage_state.json` + `cookies.json`；`logout` 清空 cookie + localStorage/sessionStorage 并删除登录态文件。
+- 已登录时调用二维码接口直接返回「已登录」（同样基于 `web_session` 判定）。
+
+### 3.3 浏览器并发锁 (browser)
+- `browser_lock`（`asyncio.Lock`）：同一 `user_data_dir` 同一时刻只能被一个持久化上下文占用，**登录与采集共享此锁**，避免「user data dir in use」冲突。
+
+### 3.4 任务编排 (tasks)
 - 任务模型：`id, topic, params, status(pending/running/success/failed), progress, created_at`。
-- 执行器：asyncio 协程消费队列；进度写 DB；通过 **SSE** 推送实时进度给前端。
+- 执行器：asyncio 协程消费队列；进度写 DB；通过 **SSE** 推送实时进度给前端（提交后实例过期，回调内先缓存标题再 yield，避免 detached 实例报错）。
 
-### 3.3 分析引擎 (analysis)
+### 3.5 分析引擎 (analysis)
 - 规则统计：词频/标签聚类（jieba 分词）、互动综合分、Top 排序。
 - LLM 拆解：将笔记标题/正文送入 LLM，按固定 schema 输出（标题公式、钩子、骨架、标签策略）。
 
-### 3.4 仿写引擎 (compose)
+### 3.6 仿写引擎 (compose)
 - 输入：参考笔记/拆解模板 + 新主题/卖点 + 风格/长度参数。
 - Prompt 管线：系统约束（原创化、平台风格）+ few-shot（拆解结论）+ 用户输入。
 - 输出 schema：`titles[], body, hashtags[], image_suggestions[]`。
@@ -72,14 +84,15 @@
 ## 4. 数据模型（SQLite）
 
 ```
-collect_task(id, topic, params_json, status, progress, total, error, created_at)
+collect_task(id, topic, total, progress, status, sort, include_comments, error, created_at)
 note(id, task_id, note_id, title, content, author, likes, collects,
-     comments, shares, publish_time, url, images_json, raw_json, created_at)
-analysis(id, task_id, type, payload_json, created_at)   -- 热词/榜单/拆解缓存
+     comments, shares, publish_time, url, cover, images_json, tags_json, created_at)
+     -- url 落库为带 xsec_token 的完整地址；created_at 用于笔记库默认倒序排序
 compose_result(id, ref_note_id, topic, titles_json, body, hashtags_json,
                images_json, created_at)
 setting(key, value_json)                                 -- LLM/采集配置(本地)
 ```
+> 登录态不入 DB，落本地文件：`user_data_dir/storage_state.json` 与 `cookies.json`。
 
 ## 5. API 设计（REST）
 
@@ -88,9 +101,10 @@ POST   /api/collect/tasks          新建采集任务 -> {task_id}
 GET    /api/collect/tasks          任务列表
 GET    /api/collect/tasks/{id}     任务详情
 GET    /api/collect/tasks/{id}/events   SSE 进度流
-POST   /api/auth/login/qrcode      获取登录二维码
-GET    /api/auth/status            登录态检测
-GET    /api/notes                  笔记列表(筛选/分页)
+POST   /api/auth/login/qrcode      获取登录二维码(返回 base64 data URL；已登录返回 loggedIn)
+GET    /api/auth/status            登录态检测(loggedIn/status/error，基于 web_session)
+POST   /api/auth/logout            退出登录(清 cookie/本地存储+删除登录态文件)
+GET    /api/notes                  笔记列表(默认按 created_at 倒序，支持 taskId 过滤)
 GET    /api/notes/{id}             笔记详情
 GET    /api/analysis/{task_id}     分析结果(热词/榜单)
 POST   /api/analysis/breakdown     单篇拆解(LLM) -> schema
@@ -120,10 +134,12 @@ GET/PUT /api/settings              读写设置
 
 - 开发：`backend`(uvicorn:8000) + `frontend`(vite:5173)，前端代理 `/api`。
 - 一键脚本：`make dev` / `pnpm dev` + `uv run`；Playwright 首次安装 Chromium。
+- real 模式：先 `python -m playwright install chromium`，再以 `REDSCOPE_COLLECT_MODE=real` 启动；登录/采集会弹出 **headed** Chromium 窗口（headless 被风控拦截）。
 - 目录：
 ```
-backend/   app/(api, collector, analysis, compose, models, core)
-frontend/  src/(pages, components, lib, store, api)
+backend/   app/(api, services/(collector,login,browser,tasks,analysis,compose,llm),
+                models, schemas, core)
+frontend/  src/(pages, components/(layout/LoginDialog…), lib, store, api)
 shared/    api-routes.ts (路径常量)
 output/    文档
 ```

@@ -36,7 +36,7 @@
 - 阴影：卡片用轻阴影 `0 1px 2px rgba(0,0,0,.06)`，悬浮态加重一档。
 
 ### 图标
-- **唯一图标库：lucide-react**。常用：LayoutDashboard、Radar、FileText、BarChart3、PenLine、Settings、QrCode、Play、RefreshCw、Download、Copy、Filter、TrendingUp。
+- **唯一图标库：lucide-react**。常用：LayoutDashboard、Radar、FileText、BarChart3、PenLine、Settings、QrCode、ScanLine、LogOut、Loader2、Play、RefreshCw、Download、Copy、Filter、TrendingUp、ExternalLink。
 
 ## 3. 栅格与响应式
 
@@ -47,7 +47,7 @@
 ## 4. 全局框架
 
 - **左侧导航 (240px)**：Logo + 6 个入口（Dashboard/Collect/Notes/Insights/Compose/Settings），当前项高亮（左侧 3px primary 条 + 浅底）。
-- **顶部栏**：当前主题/任务上下文、登录态徽标（在线绿点/失效灰点）、全局新建采集按钮。
+- **顶部栏**：当前主题/任务上下文、登录态徽标（在线绿点/未登录灰点，未登录时可点击触发扫码登录）、「扫码登录 / 退出登录」按钮、全局新建采集按钮。
 - 移动端：左侧导航转为顶部汉堡抽屉。
 
 ## 5. 关键页面与状态
@@ -60,12 +60,14 @@
 ### 5.2 Collect（采集）
 - 新建任务表单：主题输入、数量滑块、排序下拉、含评论开关、限速档位（保守/标准）。
 - 提交后任务卡片：进度条（已采/目标）、实时状态（SSE）、错误提示、重跑。
-- 登录态卡：未登录显示二维码 + 状态轮询；已登录显示账号在线。
+- 登录态卡：未登录点「扫码登录」唤起**扫码登录弹窗（LoginDialog）**；已登录显示账号在线 + 退出登录。
+- **LoginDialog（扫码登录弹窗）**：展示平台官方二维码，状态机 `loading / waiting / success / expired / error`，过期或失败提供「刷新二维码」；后台轮询登录态，成功后自动关闭。
 
 ### 5.3 Notes（笔记库）
-- 工具栏：搜索、互动量/时间筛选、排序。
+- 工具栏：搜索；排序下拉（**默认「按采集时间」倒序**，可选互动量/发布时间）；分组下拉（**「不分组 / 按采集任务分组」**）。
 - 笔记卡片网格：封面、标题、作者、互动数据（点赞/收藏/评论 带图标）。
-- 点击 → 右侧**详情抽屉**：完整正文、图片、数据、原链接、「拿去拆解/仿写」按钮。
+- 分组视图：按采集任务分区，分组头展示任务主题、笔记数徽标与采集日期，分组按任务采集时间倒序。
+- 点击 → 右侧**详情抽屉**：完整正文、图片、数据、「原文」（带 token，登录态浏览器直接打开）、「拿去拆解/仿写」按钮。
 
 ### 5.4 Insights（分析）
 - Tab：选题热词 / 爆款榜单 / 内容拆解。
@@ -100,4 +102,4 @@
 
 ## 9. 组件清单（实现参照）
 
-`AppShell / SideNav / TopBar / MetricCard / TrendChart / TaskCard / ProgressBar / LoginQRCard / NoteCard / NoteDrawer / FilterBar / WordCloud / RankingTable / BreakdownCard / ComposePanel / TitleMatrix / SettingsGroup / EmptyState / ErrorState / Skeleton / DisclaimerDialog`。
+`AppShell / SideNav / TopBar / LoginDialog / MetricCard / TrendChart / TaskCard / ProgressBar / LoginQRCard / NoteCard / NoteDrawer / FilterBar / WordCloud / RankingTable / BreakdownCard / ComposePanel / TitleMatrix / SettingsGroup / EmptyState / ErrorState / Skeleton / DisclaimerDialog`。
