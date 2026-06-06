@@ -97,11 +97,14 @@ class SettingsOut(BaseModel):
 
 class AuthStatusOut(BaseModel):
     loggedIn: bool
+    status: str = "idle"
+    error: str | None = None
 
 
 class QRCodeOut(BaseModel):
     qrcode: str
     note: str
+    loggedIn: bool = False
 
 
 class TestLLMOut(BaseModel):

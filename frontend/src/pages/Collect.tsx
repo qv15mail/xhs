@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { QrCode, Play, RefreshCw, CheckCircle2 } from "lucide-react";
+import { QrCode, Play, RefreshCw, CheckCircle2, ScanLine } from "lucide-react";
 import { api } from "@/api/client";
+import { LoginDialog } from "@/components/layout/LoginDialog";
 import { PageHeader } from "@/components/common/PageHeader";
 import { Card, CardHeader, Input, Label, Select, Switch, Badge, Progress } from "@/components/ui/primitives";
 import { Button } from "@/components/ui/Button";
@@ -26,14 +27,7 @@ const statusLabel: Record<TaskStatus, string> = {
 function LoginCard() {
   const loggedIn = useAppStore((s) => s.loggedIn);
   const setLoggedIn = useAppStore((s) => s.setLoggedIn);
-  const login = async () => {
-    try {
-      await api.login();
-    } catch {
-      /* 演示环境忽略错误 */
-    }
-    setLoggedIn(true);
-  };
+  const [open, setOpen] = useState(false);
   const logout = async () => {
     try {
       await api.logout();
@@ -44,7 +38,7 @@ function LoginCard() {
   };
   return (
     <Card>
-      <CardHeader title="登录态" description="使用本人账号登录后方可采集" />
+      <CardHeader title="登录态" description="使用本人账号扫码登录后方可采集" />
       <div className="flex flex-col items-center gap-4 p-6">
         {loggedIn ? (
           <>
@@ -62,14 +56,16 @@ function LoginCard() {
               <QrCode className="h-12 w-12" />
             </div>
             <p className="text-center text-sm text-text-mut">
-              扫码登录（演示环境点击下方按钮模拟登录成功）
+              使用小红书 App 扫码登录本人账号后开始采集
             </p>
-            <Button size="sm" onClick={login}>
-              模拟扫码登录
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <ScanLine className="h-4 w-4" />
+              扫码登录
             </Button>
           </>
         )}
       </div>
+      <LoginDialog open={open} onClose={() => setOpen(false)} />
     </Card>
   );
 }

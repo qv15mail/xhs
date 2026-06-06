@@ -1,14 +1,44 @@
 import asyncio
 import json
 import random
+import re
 import uuid
 import urllib.parse
 
 from app.core.config import settings
 from app.models import Note
 
+# 小红书正文末尾常见的话题标记，如「#露营[话题]#」，清洗为「#露营」。
+_TOPIC_TAG_RE = re.compile(r"#([^#\[\]]+?)\[话题\]#")
+
+
+def _clean_content(text: str) -> str:
+    if not text:
+        return ""
+    text = _TOPIC_TAG_RE.sub(r"#\1", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
 _COVERS = ["#fde2e4", "#e2ece9", "#cddafd", "#fff1e6", "#dfe7fd", "#fde4cf"]
 _AUTHORS = ["小羊不吃草", "护肤老中医", "城市漫游家", "穿搭研究所", "露营er阿may"]
+
+
+def _to_int(value) -> int:
+    """解析互动数：支持纯数字、字符串、以及「1.2万」「3亿」等中文计数。"""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().replace(",", "").replace("+", "")
+    if not s:
+        return 0
+    try:
+        if s.endswith("万"):
+            return int(float(s[:-1]) * 10000)
+        if s.endswith("亿"):
+            return int(float(s[:-1]) * 100000000)
+        return int(float(s))
+    except ValueError:
+        return 0
 
 
 class RateLimiter:
@@ -63,92 +93,56 @@ def _mock_note(i: int, task_id: str, topic: str) -> Note:
 class Collector:
     """采集器：默认 mock；real 模式走 Playwright（需用户自有登录态）。"""
 
-    # 详情页 DOM 抽取脚本（含从 __INITIAL_STATE__ 兜底解析）。
+    # 详情页抽取脚本：优先 window.__INITIAL_STATE__.note.noteDetailMap，DOM 兜底。
     _NOTE_DETAIL_SCRIPT = r"""
         (noteId) => {
             const result = {
-                noteId: noteId,
-                title: '',
-                author: '',
-                likes: 0,
-                collects: 0,
-                comments: 0,
-                shares: 0,
-                publishTime: '',
-                content: '',
-                tags: []
+                noteId: noteId, title: '', author: '', content: '',
+                likes: '', collects: '', comments: '', shares: '',
+                publishTime: '', cover: '', tags: [], images: []
             };
-
             const text = (el) => el ? el.textContent.trim() : '';
 
-            const titleEl = document.querySelector('h1, .note-article__title, .note-container__title, .article-title');
-            if (titleEl) result.title = text(titleEl);
-            if (!result.title) {
-                const exploreTitle = document.querySelector('.note-detail__title, .detail__title, .note-info__title');
-                if (exploreTitle) result.title = text(exploreTitle);
-            }
-
-            const authorEl = document.querySelector('.author__name, .author-name, .user-name, .note-detail__author, .detail-author');
-            if (authorEl) result.author = text(authorEl);
-
-            const timeEl = document.querySelector('.publish-time, .time, [class*="time"]');
-            if (timeEl) result.publishTime = text(timeEl);
-
-            const contentEl = document.querySelector('.article-article .article-content, .note-article__content, .note-detail__content, .article-title + p, .markdown-body, .note-content');
-            if (contentEl) result.content = text(contentEl);
-
-            const tagEls = document.querySelectorAll('[class*="tag"], .search-result__tags, .note-detail__tag, .hashtag');
-            tagEls.forEach(el => {
-                const t = text(el);
-                if (t && !t.includes('话题')) result.tags.push(t);
-            });
-
-            // 从 window.__INITIAL_STATE__ / __INITIAL_SSR_STATE__ 兜底提取结构化数据
-            const findInState = (root) => {
-                if (!root || typeof root !== 'object') return null;
-                if (root.noteId === noteId || root.note_id === noteId) return root;
-                for (const key of Object.keys(root)) {
-                    if (key === '__N_SSP__' || key === '__N_SSG__') continue;
-                    try {
-                        const hit = findInState(root[key]);
-                        if (hit) return hit;
-                    } catch (e) { /* 忽略循环引用等异常 */ }
-                }
-                return null;
-            };
-
+            // 1) 结构化数据：__INITIAL_STATE__.note.noteDetailMap
             try {
-                const initialState = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
-                if (initialState) {
-                    const noteData = findInState(initialState);
-                    const note = noteData && (noteData.note || noteData.noteCard || noteData);
-                    if (note) {
-                        if (!result.title) result.title = note.title || '';
-                        if (!result.author) {
-                            const u = note.user || note.author || {};
-                            result.author = u.nickname || u.nickName || u.nickname_or_id || result.author;
+                const s = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
+                const map = s && s.note && s.note.noteDetailMap;
+                if (map) {
+                    let entry = map[noteId];
+                    if (!entry) {
+                        const k = Object.keys(map).find(x => x !== 'undefined' && map[x] && map[x].note);
+                        if (k) entry = map[k];
+                    }
+                    const n = entry && entry.note;
+                    if (n) {
+                        result.title = n.title || '';
+                        result.content = n.desc || n.content || '';
+                        result.author = (n.user || {}).nickname || (n.user || {}).nickName || '';
+                        const ii = n.interactInfo || {};
+                        result.likes = ii.likedCount != null ? ii.likedCount : '';
+                        result.collects = ii.collectedCount != null ? ii.collectedCount : '';
+                        result.comments = ii.commentCount != null ? ii.commentCount : '';
+                        result.shares = ii.shareCount != null ? ii.shareCount : '';
+                        if (n.time) result.publishTime = String(n.time);
+                        if (Array.isArray(n.tagList)) {
+                            n.tagList.forEach(t => { if (t && t.name) result.tags.push(t.name); });
                         }
-                        if (!result.content) result.content = note.content || note.desc || note.markdown_desc || '';
-                        const ii = note.interactInfo || note.interact_info;
-                        if (ii) {
-                            result.likes = ii.liked_count || ii.likedCount || 0;
-                            result.collects = ii.collected_count || ii.collectedCount || 0;
-                            result.comments = ii.comment_count || ii.commentCount || 0;
-                            result.shares = ii.share_count || ii.shareCount || 0;
-                        }
-                        if (Array.isArray(note.tagList)) {
-                            note.tagList.forEach(t => { if (t && t.name) result.tags.push(t.name); });
-                        } else if (Array.isArray(note.tags)) {
-                            note.tags.forEach(t => {
-                                const name = typeof t === 'string' ? t : (t && (t.name || t.noteName));
-                                if (name) result.tags.push(name);
+                        const imgs = n.imageList || n.imagesList || [];
+                        if (Array.isArray(imgs)) {
+                            imgs.forEach(im => {
+                                const u = im && (im.urlDefault || im.url || (im.infoList && im.infoList[0] && im.infoList[0].url));
+                                if (u) result.images.push(u);
                             });
                         }
+                        if (result.images.length) result.cover = result.images[0];
                     }
                 }
-            } catch (e) {
-                console.warn('[Collector] 解析 __INITIAL_STATE__ 失败', e);
-            }
+            } catch (e) { /* ignore */ }
+
+            // 2) DOM 兜底
+            if (!result.title) result.title = text(document.querySelector('#detail-title, .note-content .title, h1'));
+            if (!result.content) result.content = text(document.querySelector('#detail-desc, .note-text, .desc'));
+            if (!result.author) result.author = text(document.querySelector('.author-wrapper .username, .username, .author-name'));
 
             return result;
         }
@@ -174,9 +168,9 @@ class Collector:
         """
         真实采集路径：Playwright 持久化上下文。
 
-        由于小红书搜索页有较强的反爬措施，采用更可靠的方式：
-        1. 直接访问推荐页，收集笔记 URL
-        2. 逐条访问详情页提取数据
+        小红书笔记详情页需要 `xsec_token` 才能访问（缺失会重定向到 404）。
+        因此先从「搜索结果页」（主题驱动）或「推荐页」收集 (note_id, xsec_token, source)，
+        再带 token 逐条访问详情页，从 `window.__INITIAL_STATE__` 提取结构化数据。
         """
         try:
             from playwright.async_api import async_playwright
@@ -186,88 +180,49 @@ class Collector:
             return
 
         user_data_dir = settings.user_data_dir
-        state_path = f"{user_data_dir}/storage_state.json"
 
         try:
-            async with async_playwright() as p:
-                if not __import__("os").path.exists(state_path):
-                    print(
-                        f"[Collector] 未找到登录态文件 {state_path}，请先在浏览器中完成登录..."
-                    )
-                    context = await p.chromium.launch_persistent_context(
-                        user_data_dir, headless=False, viewport={"width": 1280, "height": 800}
-                    )
-                    page = context.pages[0] if context.pages else await context.new_page()
-                    await page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded")
-                    print(
-                        "[Collector] 请在打开的浏览器中完成登录；登录完成后请按回车继续..."
-                    )
-                    await asyncio.to_thread(input)
-                    await context.storage_state(path=state_path)
-                    await context.close()
-                    print(f"[Collector] 登录态已保存: {state_path}")
+            from app.services.browser import browser_lock
 
-                # ===== 正式采集 =====
+            async with browser_lock, async_playwright() as p:
                 context = await p.chromium.launch_persistent_context(
                     user_data_dir,
                     headless=False,
+                    viewport={"width": 1280, "height": 800},
                 )
-                page = await context.new_page()
+                page = context.pages[0] if context.pages else await context.new_page()
 
-                # 先访问首页加载登录态
-                await page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded")
-                await page.wait_for_timeout(3000)
+                # 主题驱动：优先搜索页；不足再用推荐页补充
+                items = await self._collect_search_items(page, topic, total)
+                print(f"[Collector] 搜索页「{topic}」提取到 {len(items)} 个笔记")
+                if len(items) < total:
+                    feed_items = await self._collect_feed_items(page, total - len(items))
+                    print(f"[Collector] 推荐页补充 {len(feed_items)} 个笔记")
+                    items.extend(feed_items)
 
-                # 从首页提取 note_id
-                note_ids = await self._extract_note_ids_from_page_async(page)
-                print(f"[Collector] 首页提取到 {len(note_ids)} 个笔记")
+                # 去重
+                seen: set[str] = set()
+                uniq: list[dict] = []
+                for it in items:
+                    if it["id"] and it["id"] not in seen:
+                        seen.add(it["id"])
+                        uniq.append(it)
 
-                # 滚动加载更多
-                for page_num in range(5):
-                    if len(note_ids) >= total:
-                        break
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    await page.wait_for_timeout(3000)
-                    new_ids = await self._extract_note_ids_from_page_async(page)
-                    added = [nid for nid in new_ids if nid not in note_ids]
-                    note_ids.extend(added)
-                    print(f"[Collector] 滚动 #{page_num + 1} 后共 {len(note_ids)} 个笔记")
-
-                if not note_ids:
-                    # 首页没拿到，尝试搜索页
-                    print("[Collector] 首页未找到笔记，尝试搜索页...")
-                    search_url = f"https://www.xiaohongshu.com/search_result?keyword={urllib.parse.quote(topic)}&source=web_search_result_notes"
-                    await page.goto(search_url, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(5000)
-                    note_ids = await self._extract_note_ids_from_page_async(page)
-                    print(f"[Collector] 搜索页提取到 {len(note_ids)} 个笔记")
-
-                # 如果还是不够，从推荐页的链接中获取更多
-                for page_num in range(5):
-                    if len(note_ids) >= total:
-                        break
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    await page.wait_for_timeout(2000)
-                    new_ids = await self._extract_note_ids_from_page_async(page)
-                    added = [nid for nid in new_ids if nid not in note_ids]
-                    note_ids.extend(added)
-                    print(f"[Collector] 继续滚动 #{page_num + 1} 后共 {len(note_ids)} 个笔记")
-
-                # 逐条访问详情页提取数据
                 count = 0
-                for note_id in note_ids[:total]:
+                for it in uniq[:total]:
                     await limiter.acquire()
                     try:
                         await limiter.wait()
-                        note = await self._fetch_note_detail(page, task_id, note_id)
+                        note = await self._fetch_note_detail(page, task_id, it)
                         if note:
+                            title = note.title
                             yield note
                             count += 1
-                            print(f"[Collector] 已采集 {count}/{total}: {note.title}")
+                            print(f"[Collector] 已采集 {count}/{total}: {title}")
                         else:
-                            print(f"[Collector] 跳过 {note_id}（无法获取详情）")
-                    except Exception as e:
-                        print(f"[Collector] 采集 {note_id} 失败: {e}")
+                            print(f"[Collector] 跳过 {it['id']}（无法获取详情）")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[Collector] 采集 {it['id']} 失败: {e}")
                     finally:
                         limiter.release()
 
@@ -276,71 +231,147 @@ class Collector:
 
         except Exception as e:  # noqa: BLE001
             import traceback
+
             traceback.print_exc()
             print(f"[Collector] 采集异常: {e}")
             for i in range(total):
                 yield _mock_note(i, task_id, topic)
 
-    def _extract_note_ids_from_page(self, page) -> list[str]:
-        """从当前页面提取所有 note_id（通过 JavaScript 执行）"""
-        return page.evaluate("""
+    # 从搜索结果页 DOM 提取 (id, token, source)：搜索页 a[href] 自带 xsec_token。
+    _SEARCH_ITEMS_SCRIPT = r"""
+        () => {
+            const out = [];
+            const seen = new Set();
+            document.querySelectorAll('a[href*="/search_result/"], a[href*="/explore/"]').forEach(a => {
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/(?:search_result|explore)\/([a-f0-9]+)/);
+                if (!m || !m[1] || seen.has(m[1])) return;
+                let token = '', source = '';
+                try {
+                    const qs = new URLSearchParams(href.split('?')[1] || '');
+                    token = qs.get('xsec_token') || '';
+                    source = qs.get('xsec_source') || '';
+                } catch (e) { /* ignore */ }
+                if (!token) return;
+                seen.add(m[1]);
+                out.push({ id: m[1], token, source: source || 'pc_search' });
+            });
+            return out;
+        }
+    """
+
+    async def _collect_search_items(self, page, topic: str, total: int) -> list[dict]:
+        search_url = (
+            "https://www.xiaohongshu.com/search_result?"
+            f"keyword={urllib.parse.quote(topic)}&source=web_search_result_notes"
+        )
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Collector] 搜索页打开失败: {e}")
+            return []
+        await page.wait_for_timeout(5000)
+
+        items: list[dict] = []
+        seen: set[str] = set()
+
+        async def harvest():
+            for it in await page.evaluate(self._SEARCH_ITEMS_SCRIPT):
+                if it["id"] not in seen:
+                    seen.add(it["id"])
+                    items.append(it)
+
+        await harvest()
+        for _ in range(8):
+            if len(items) >= total:
+                break
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
+            await page.wait_for_timeout(2500)
+            await harvest()
+        return items
+
+    async def _collect_feed_items(self, page, total: int) -> list[dict]:
+        try:
+            await page.goto(
+                "https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=20000
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[Collector] 推荐页打开失败: {e}")
+            return []
+        await page.wait_for_timeout(4000)
+
+        # 推荐页 token 在 __INITIAL_STATE__.feed.feeds 中，DOM href 不带 token。
+        script = r"""
             () => {
-                const allLinks = document.querySelectorAll('a');
-                const ids = [];
-                const seen = new Set();
-                allLinks.forEach(a => {
-                    const href = a.href;
-                    // 匹配 search_result/{noteId} 或 explore/{noteId}
-                    const searchMatch = href.match(/search_result\\/([a-f0-9]+)/);
-                    const exploreMatch = href.match(/explore\\/([a-f0-9]+)/);
-                    const match = searchMatch || exploreMatch;
-                    if (match && match[1] && !seen.has(match[1])) {
-                        seen.add(match[1]);
-                        ids.push(match[1]);
+                const out = [];
+                try {
+                    const s = window.__INITIAL_STATE__;
+                    let fd = s && s.feed && s.feed.feeds;
+                    if (fd && fd._value !== undefined) fd = fd._value;
+                    if (Array.isArray(fd)) {
+                        fd.forEach(n => {
+                            if (n && n.id && n.xsecToken) {
+                                out.push({ id: n.id, token: n.xsecToken, source: 'pc_feed' });
+                            }
+                        });
                     }
-                });
-                return ids;
+                } catch (e) { /* ignore */ }
+                return out;
             }
-        """)
+        """
+        items: list[dict] = []
+        seen: set[str] = set()
 
-    async def _extract_note_ids_from_page_async(self, page) -> list[str]:
-        """异步版提取 note_id"""
-        return await self._extract_note_ids_from_page(page)
+        async def harvest():
+            for it in await page.evaluate(script):
+                if it["id"] not in seen:
+                    seen.add(it["id"])
+                    items.append(it)
 
-    async def _fetch_note_detail(self, page, task_id: str, note_id: str) -> Note | None:
-        """访问笔记详情页提取结构化数据"""
-        url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        await harvest()
+        for _ in range(6):
+            if len(items) >= total:
+                break
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 1.5)")
+            await page.wait_for_timeout(2500)
+            await harvest()
+        return items
+
+    async def _fetch_note_detail(self, page, task_id: str, item: dict) -> Note | None:
+        """带 xsec_token 访问笔记详情页，从 __INITIAL_STATE__ 提取结构化数据。"""
+        note_id = item["id"]
+        token = item.get("token", "")
+        source = item.get("source") or "pc_feed"
+        url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={token}&xsec_source={source}"
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(3000)  # 等待 JS 渲染
+            await page.wait_for_timeout(2500)
 
-            # 从页面提取笔记数据
             data = await page.evaluate(self._NOTE_DETAIL_SCRIPT, note_id)
 
-            if not data.get("title") and not data.get("author"):
-                # 尝试了所有方式都没拿到数据，可能页面被风控
-                print(f"[Collector] 未获取到笔记 {note_id} 的数据，回退到 mock")
+            if not data.get("title") and not data.get("author") and not data.get("content"):
+                print(f"[Collector] 未获取到笔记 {note_id} 的数据，回退占位")
                 return self._fallback_note(task_id, note_id, note_id)
 
             return Note(
                 id=f"{task_id}-{note_id}",
                 task_id=task_id,
                 note_id=note_id,
-                title=data["title"] or f"小红书笔记 {note_id}",
-                content=data["content"] or f"这是一篇关于 {data['title']} 的小红书笔记。",
-                author=data["author"] or "小红书用户",
-                likes=data["likes"],
-                collects=data["collects"],
-                comments=data["comments"],
-                shares=data["shares"],
-                publish_time=data["publishTime"],
+                title=data.get("title") or f"小红书笔记 {note_id}",
+                content=_clean_content(data.get("content")) or "",
+                author=data.get("author") or "小红书用户",
+                likes=_to_int(data.get("likes")),
+                collects=_to_int(data.get("collects")),
+                comments=_to_int(data.get("comments")),
+                shares=_to_int(data.get("shares")),
+                publish_time=data.get("publishTime") or "",
                 url=f"https://www.xiaohongshu.com/explore/{note_id}",
-                cover=random.choice(_COVERS),
-                images_json="[]",
-                tags_json=json.dumps(data.get("tags", ["小红书"]), ensure_ascii=False),
+                cover=data.get("cover") or random.choice(_COVERS),
+                images_json=json.dumps(data.get("images", []), ensure_ascii=False),
+                tags_json=json.dumps(data.get("tags", []), ensure_ascii=False),
             )
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[Collector] 详情页请求失败 {note_id}: {e}")
             return self._fallback_note(task_id, note_id, note_id)
 

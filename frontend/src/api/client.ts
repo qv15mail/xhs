@@ -73,8 +73,8 @@ export const api = {
   testLLM: () =>
     request<{ ok: boolean; message: string }>(`${ApiRoutes.settings}/test-llm`, { method: "POST" }),
 
-  login: () =>
-    request<{ loggedIn: boolean }>(ApiRoutes.authLoginConfirm, {
+  loginQrcode: () =>
+    request<{ qrcode: string; note: string; loggedIn: boolean }>(ApiRoutes.authLoginQrcode, {
       method: "POST",
     }),
 
@@ -83,5 +83,6 @@ export const api = {
       method: "POST",
     }),
 
-  authStatus: () => request<{ loggedIn: boolean }>(ApiRoutes.authStatus),
+  authStatus: () =>
+    request<{ loggedIn: boolean; status: string; error: string | null }>(ApiRoutes.authStatus),
 };
