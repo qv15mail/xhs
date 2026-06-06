@@ -342,7 +342,13 @@ class Collector:
         note_id = item["id"]
         token = item.get("token", "")
         source = item.get("source") or "pc_feed"
-        url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={token}&xsec_source={source}"
+        # 带 xsec_token 的完整地址：登录态浏览器可直接打开详情，避免跳到扫码墙。
+        url = (
+            f"https://www.xiaohongshu.com/explore/{note_id}"
+            f"?xsec_token={token}&xsec_source={source}"
+            if token
+            else f"https://www.xiaohongshu.com/explore/{note_id}"
+        )
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await page.wait_for_timeout(2500)
@@ -365,7 +371,7 @@ class Collector:
                 comments=_to_int(data.get("comments")),
                 shares=_to_int(data.get("shares")),
                 publish_time=data.get("publishTime") or "",
-                url=f"https://www.xiaohongshu.com/explore/{note_id}",
+                url=url,
                 cover=data.get("cover") or random.choice(_COVERS),
                 images_json=json.dumps(data.get("images", []), ensure_ascii=False),
                 tags_json=json.dumps(data.get("tags", []), ensure_ascii=False),

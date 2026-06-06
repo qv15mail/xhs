@@ -33,4 +33,5 @@ def note_to_out(n: Note) -> NoteOut:
         url=n.url,
         cover=n.cover,
         tags=json.loads(n.tags_json or "[]"),
+        createdAt=n.created_at.isoformat(),
     )

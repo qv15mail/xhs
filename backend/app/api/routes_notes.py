@@ -18,7 +18,7 @@ def list_notes(
     stmt = select(Note)
     if taskId:
         stmt = stmt.where(Note.task_id == taskId)
-    stmt = stmt.order_by(Note.likes.desc()).limit(limit)
+    stmt = stmt.order_by(Note.created_at.desc()).limit(limit)
     return [note_to_out(n) for n in session.exec(stmt).all()]
 
 

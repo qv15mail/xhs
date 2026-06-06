@@ -26,6 +26,7 @@ export interface Note {
   url: string;
   cover: string;
   tags: string[];
+  createdAt: string;
 }
 
 export interface Keyword {

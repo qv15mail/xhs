@@ -34,6 +34,7 @@ class NoteOut(BaseModel):
     url: str
     cover: str
     tags: list[str]
+    createdAt: str
 
 
 class KeywordOut(BaseModel):
